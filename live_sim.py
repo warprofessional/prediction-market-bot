@@ -1,21 +1,26 @@
-"""10-minute live simulation against real Polymarket.
+"""Live simulation using REAL signals from Polymarket data.
 
-Scans real markets every 30s, generates signals, simulates execution,
-tracks paper P&L in real-time. Shows exactly what the bot would do.
+No ML model. Uses the same signals the Twitter research identified:
+- Price momentum (from historical price changes)
+- Orderbook imbalance (from real orderbook)
+- Crowd bias detection (from price extremes)
+- Mean-reversion (from price distance to 50%)
+- Cross-check YES+NO pricing (arb detection)
+
+The strategy IS the model. The 7 signals ARE the edge.
 
 Usage: python3 live_sim.py [--minutes 10] [--interval 30]
 """
 import asyncio
 import json
 import logging
+import math
 import sys
 import time
 from datetime import datetime
 
 import httpx
-import numpy as np
 
-from src.strategies.unified_strategy import unified_strategy
 from src.strategies.market_filter import should_trade, classify_market
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -25,15 +30,93 @@ GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 
 
+def compute_model_prob_from_signals(market_price, prev_price, book, yes_no_total):
+    """Compute model probability using REAL signals — no ML needed.
+    
+    This is what the Twitter research taught us:
+    1. OBI from real orderbook → which direction has more pressure
+    2. Momentum from price change → is the market trending
+    3. YES+NO mispricing → arb opportunity
+    4. Crowd bias at extremes → fade overconfidence
+    5. Mean-reversion tendency → prices revert to fundamentals
+    """
+    signals = {}
+    adjustment = 0.0
+    
+    # --- SIGNAL: Orderbook Imbalance ---
+    # @MarikWeb3: OBI explains ~65% of short-term price variance
+    if book:
+        bid_d = book["bid_depth"]
+        ask_d = book["ask_depth"]
+        total = bid_d + ask_d
+        if total > 0:
+            obi = (bid_d - ask_d) / total  # +1 = all bids, -1 = all asks
+            # Strong bid pressure → price should go up
+            if obi > 0.2:
+                adjustment += 0.01 * obi
+                signals["obi"] = f"+{obi:.2f} (buy pressure)"
+            elif obi < -0.2:
+                adjustment += 0.01 * obi
+                signals["obi"] = f"{obi:.2f} (sell pressure)"
+    
+    # --- SIGNAL: Momentum ---
+    # @db_polybot (live Rust bot): "waits for momentum confirmation before sizing"
+    if prev_price and prev_price != market_price:
+        price_change = market_price - prev_price
+        # If price is trending, model should agree with trend slightly
+        if abs(price_change) > 0.005:
+            adjustment += price_change * 0.3  # Follow momentum partially
+            signals["momentum"] = f"{price_change:+.3f}"
+    
+    # --- SIGNAL: YES+NO Arb ---
+    # Gabagool ladder bot: if YES+NO < 1.00, there's free money
+    if yes_no_total < 0.995:
+        arb_edge = 1.0 - yes_no_total
+        # If there's arb, price should be higher (market undervalues)
+        adjustment += arb_edge * 0.5
+        signals["arb"] = f"gap={arb_edge:.3f}"
+    
+    # --- SIGNAL: Optimism Tax Fade ---
+    # Becker (2026): "Takers overpay for YES"
+    # When crowd is extremely confident (>85%), fade slightly
+    if market_price > 0.85:
+        fade = (market_price - 0.85) * 0.15  # Small fade of extreme confidence
+        adjustment -= fade
+        signals["optimism_fade"] = f"-{fade:.3f} (crowd too bullish)"
+    elif market_price < 0.15:
+        fade = (0.15 - market_price) * 0.15
+        adjustment += fade
+        signals["optimism_fade"] = f"+{fade:.3f} (crowd too bearish)"
+    
+    # --- SIGNAL: Mean-Reversion ---
+    # @frostikkkk: EMA ±8% deviation mean-reversion
+    # Prices far from 50% tend to revert (on binary markets without strong info)
+    distance_from_mid = market_price - 0.5
+    if abs(distance_from_mid) > 0.3:
+        reversion = -distance_from_mid * 0.05  # Gentle pull toward center
+        adjustment += reversion
+        signals["mean_rev"] = f"{reversion:+.3f}"
+    
+    # --- SIGNAL: Spread Quality ---
+    # Wide spread = uncertain market = bigger potential edge
+    if book and book["spread"] < 0.03:
+        # Tight spread = efficient market, reduce confidence
+        adjustment *= 0.7
+        signals["spread"] = f"tight ({book['spread']:.3f}), reduced"
+    
+    model_prob = max(0.01, min(0.99, market_price + adjustment))
+    return model_prob, signals
+
+
 class PaperTrader:
     def __init__(self, capital=1000.0):
         self.initial_capital = capital
         self.capital = capital
-        self.positions = {}  # token_id → position
+        self.positions = {}
         self.closed_trades = []
         self.scan_count = 0
         self.signal_count = 0
-        self.price_cache = {}  # token_id → last price
+        self.price_cache = {}
     
     @property
     def unrealized_pnl(self):
@@ -57,22 +140,21 @@ class PaperTrader:
     def status_line(self):
         eq = self.total_equity
         ret = (eq - self.initial_capital) / self.initial_capital
-        ur = self.unrealized_pnl
         n_open = len(self.positions)
         n_closed = len(self.closed_trades)
         wins = sum(1 for t in self.closed_trades if t["pnl"] > 0)
         wr = wins / n_closed * 100 if n_closed else 0
         return (
-            f"💰 Equity: ${eq:.2f} ({ret:+.2%}) | "
-            f"Open: {n_open} | Closed: {n_closed} (WR {wr:.0f}%) | "
-            f"Realized: ${self.realized_pnl:.2f} | Unrealized: ${ur:.2f}"
+            f"💰 ${eq:.2f} ({ret:+.2%}) | "
+            f"Open:{n_open} Closed:{n_closed} WR:{wr:.0f}% | "
+            f"Real:${self.realized_pnl:.2f} Unreal:${self.unrealized_pnl:.2f}"
         )
 
 
 async def fetch_markets():
     async with httpx.AsyncClient(timeout=15) as c:
         resp = await c.get(f"{GAMMA}/markets", params={
-            "limit": 60, "active": True, "order": "liquidity", "ascending": False
+            "limit": 80, "active": True, "order": "liquidity", "ascending": False
         })
         resp.raise_for_status()
         out = []
@@ -82,35 +164,62 @@ async def fetch_markets():
             if len(tokens) >= 2 and len(prices) >= 2:
                 q = m.get("question", "")
                 yp = float(prices[0])
+                np_ = float(prices[1])
                 liq = float(m.get("liquidity", 0))
                 ok, reason = should_trade(q, yp, liq)
                 if ok:
-                    out.append({"q": q, "token": tokens[0], "price": yp, "liq": liq, "type": classify_market(q)})
+                    out.append({
+                        "q": q, "token": tokens[0], "price": yp,
+                        "no_price": np_, "total": yp + np_,
+                        "liq": liq, "type": classify_market(q),
+                    })
         return out
 
 
+async def fetch_book(token_id):
+    async with httpx.AsyncClient(timeout=8) as c:
+        try:
+            resp = await c.get(f"{CLOB}/book", params={"token_id": token_id})
+            if resp.status_code == 200:
+                data = resp.json()
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
+                return {
+                    "best_bid": float(bids[0]["price"]) if bids else 0,
+                    "best_ask": float(asks[0]["price"]) if asks else 1,
+                    "bid_depth": sum(float(b["size"]) * float(b["price"]) for b in bids[:5]),
+                    "ask_depth": sum(float(a["size"]) * float(a["price"]) for a in asks[:5]),
+                    "spread": (float(asks[0]["price"]) - float(bids[0]["price"])) if bids and asks else 1,
+                }
+        except:
+            pass
+    return None
+
+
 async def run_sim(minutes=10, interval=30):
+    from src.strategies.unified_strategy import unified_strategy
+    
     trader = PaperTrader(capital=1000.0)
     end_time = time.time() + minutes * 60
     
-    log.info("=" * 65)
-    log.info(f"  LIVE SIMULATION — {minutes} minutes, scanning every {interval}s")
-    log.info(f"  Capital: ${trader.capital:.0f} | Strategy: unified | Markets: filtered")
-    log.info("=" * 65)
+    log.info("=" * 70)
+    log.info(f"  LIVE SIM — {minutes}min, every {interval}s | REAL SIGNALS (no ML)")
+    log.info(f"  Signals: OBI + Momentum + Arb + Optimism Fade + Mean-Rev")
+    log.info(f"  Capital: ${trader.capital:.0f}")
+    log.info("=" * 70)
     
     while time.time() < end_time:
         trader.scan_count += 1
         remaining = (end_time - time.time()) / 60
-        log.info(f"\n--- Scan #{trader.scan_count} | {remaining:.1f} min remaining ---")
+        log.info(f"\n--- Scan #{trader.scan_count} | {remaining:.1f}min left ---")
         
         try:
             markets = await fetch_markets()
             log.info(f"  {len(markets)} tradeable markets")
             
-            # Update price cache and check exits
+            # Update prices & manage exits
             for tid in list(trader.positions.keys()):
                 pos = trader.positions[tid]
-                # Find current price
                 for m in markets:
                     if m["token"] == tid:
                         trader.price_cache[tid] = m["price"]
@@ -122,36 +231,26 @@ async def run_sim(minutes=10, interval=30):
                 else:
                     ur = (pos["entry"] - current) * pos["shares"]
                 
-                pos["hold_scans"] = pos.get("hold_scans", 0) + 1
+                pos["hold"] = pos.get("hold", 0) + 1
                 
-                # Exit conditions (same as backtester)
                 should_exit = (
-                    ur < -pos["usd"] * 0.015 or       # SL 1.5%
-                    pos["hold_scans"] >= 3 or           # Max 3 scans
-                    ur > pos["usd"] * 0.025             # TP 2.5%
+                    ur < -pos["usd"] * 0.015 or
+                    pos["hold"] >= 3 or
+                    ur > pos["usd"] * 0.025
                 )
                 
                 if should_exit:
-                    pnl = ur - pos["usd"] * 0.002  # Fee
+                    pnl = ur - pos["usd"] * 0.002
                     trader.capital += pos["usd"] + pnl
-                    trader.closed_trades.append({
-                        "market": pos["market"],
-                        "side": pos["side"],
-                        "entry": pos["entry"],
-                        "exit": current,
-                        "pnl": pnl,
-                        "hold": pos["hold_scans"],
-                    })
-                    emoji = "✅" if pnl > 0 else "❌"
-                    log.info(f"  {emoji} CLOSED {pos['side'].upper()} {pos['market'][:40]} | PnL: ${pnl:.2f}")
+                    trader.closed_trades.append({"market": pos["market"], "pnl": pnl, "side": pos["side"]})
+                    e = "✅" if pnl > 0 else "❌"
+                    log.info(f"  {e} CLOSE {pos['side']} {pos['market'][:40]} PnL:${pnl:.2f}")
                     del trader.positions[tid]
             
-            # Scan for new signals
+            # Scan for new entries using REAL signals
             for m in markets:
-                if m["token"] in trader.positions:
+                if m["token"] in trader.positions or len(trader.positions) >= 5:
                     continue
-                if len(trader.positions) >= 5:  # Max 5 concurrent positions
-                    break
                 
                 mp = m["price"]
                 if mp <= 0.03 or mp >= 0.97:
@@ -160,62 +259,62 @@ async def run_sim(minutes=10, interval=30):
                 prev = trader.price_cache.get(m["token"], mp)
                 trader.price_cache[m["token"]] = mp
                 
-                # Strategy uses model_prob = slight perturbation of market
-                # In real deployment this would be a real ML model
-                for offset in [0.02, -0.02, 0.03, -0.03]:
-                    model = max(0.01, min(0.99, mp + offset))
-                    signal = unified_strategy(model, mp, trader.capital, prev)
+                # Get real orderbook
+                book = await fetch_book(m["token"])
+                
+                # Compute model prob from REAL signals
+                model_prob, sigs = compute_model_prob_from_signals(
+                    mp, prev, book, m["total"]
+                )
+                
+                # Run through the full strategy
+                signal = unified_strategy(model_prob, mp, trader.capital, prev)
+                
+                if signal and signal.get("size_usd", 0) > 5:
+                    size = min(signal["size_usd"], trader.capital * 0.15)
+                    fee = size * 0.002
+                    slippage = mp * 0.001
+                    entry = mp + slippage if signal["side"] == "buy" else mp - slippage
                     
-                    if signal and signal.get("size_usd", 0) > 5:
-                        size = min(signal["size_usd"], trader.capital * 0.15)
-                        fee = size * 0.002
-                        slippage = mp * 0.001
-                        entry = mp + slippage if signal["side"] == "buy" else mp - slippage
-                        
-                        trader.capital -= size
-                        shares = (size - fee) / entry
-                        trader.positions[m["token"]] = {
-                            "market": m["q"][:50],
-                            "side": signal["side"],
-                            "entry": entry,
-                            "usd": size,
-                            "shares": shares,
-                            "hold_scans": 0,
-                        }
-                        trader.signal_count += 1
-                        log.info(f"  🔵 OPEN {signal['side'].upper()} ${size:.0f} on {m['q'][:45]} @ {entry:.3f}")
-                        break
+                    trader.capital -= size
+                    shares = (size - fee) / max(entry, 0.001)
+                    trader.positions[m["token"]] = {
+                        "market": m["q"][:50], "side": signal["side"],
+                        "entry": entry, "usd": size, "shares": shares, "hold": 0,
+                    }
+                    trader.signal_count += 1
+                    sig_str = ", ".join(f"{k}:{v}" for k, v in sigs.items())
+                    log.info(f"  🔵 {signal['side'].upper()} ${size:.0f} {m['q'][:40]} @ {entry:.3f}")
+                    log.info(f"     Signals: {sig_str}")
+                
+                await asyncio.sleep(0.05)
             
             log.info(f"  {trader.status_line()}")
-            
+        
         except Exception as e:
             log.error(f"  Error: {e}")
         
         await asyncio.sleep(interval)
     
-    # Final report
-    log.info("\n" + "=" * 65)
+    # Final
+    log.info("\n" + "=" * 70)
     log.info("  SIMULATION COMPLETE")
-    log.info("=" * 65)
-    log.info(f"  Duration: {minutes} minutes | Scans: {trader.scan_count}")
-    log.info(f"  Signals generated: {trader.signal_count}")
-    log.info(f"  Trades closed: {len(trader.closed_trades)}")
+    log.info("=" * 70)
+    log.info(f"  Duration: {minutes}min | Scans: {trader.scan_count} | Signals: {trader.signal_count}")
+    log.info(f"  Closed: {len(trader.closed_trades)} | Open: {len(trader.positions)}")
     if trader.closed_trades:
         wins = sum(1 for t in trader.closed_trades if t["pnl"] > 0)
         log.info(f"  Win rate: {wins}/{len(trader.closed_trades)} ({wins/len(trader.closed_trades)*100:.0f}%)")
-        log.info(f"  Realized PnL: ${trader.realized_pnl:.2f}")
-    log.info(f"  Open positions: {len(trader.positions)}")
     log.info(f"  {trader.status_line()}")
-    log.info("=" * 65)
+    log.info("=" * 70)
 
 
 if __name__ == "__main__":
     minutes = 10
     interval = 30
-    for i, arg in enumerate(sys.argv[1:], 1):
-        if arg == "--minutes" and i < len(sys.argv) - 1:
+    for i, arg in enumerate(sys.argv):
+        if arg == "--minutes" and i + 1 < len(sys.argv):
             minutes = int(sys.argv[i + 1])
-        elif arg == "--interval" and i < len(sys.argv) - 1:
+        elif arg == "--interval" and i + 1 < len(sys.argv):
             interval = int(sys.argv[i + 1])
-    
     asyncio.run(run_sim(minutes, interval))
